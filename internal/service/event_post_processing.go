@@ -16,6 +16,7 @@ import (
 	"github.com/flexprice/flexprice/internal/config"
 	"github.com/flexprice/flexprice/internal/domain/events"
 	"github.com/flexprice/flexprice/internal/domain/feature"
+	"github.com/flexprice/flexprice/internal/domain/group"
 	"github.com/flexprice/flexprice/internal/domain/meter"
 	"github.com/flexprice/flexprice/internal/domain/price"
 	"github.com/flexprice/flexprice/internal/domain/subscription"
@@ -1043,11 +1044,11 @@ func (s *eventPostProcessingService) GetDetailedUsageAnalytics(ctx context.Conte
 
 	// Step 6: If no results, return early
 	if len(analytics) == 0 {
-		return s.ToGetUsageAnalyticsResponseDTO(ctx, analytics)
+		return s.ToGetUsageAnalyticsResponseDTO(ctx, analytics, nil)
 	}
 
 	// Step 7: Enrich with feature and meter data from their respective repositories
-	err = s.enrichAnalyticsWithFeatureAndMeterData(ctx, analytics)
+	featureMap, err := s.enrichAnalyticsWithFeatureAndMeterData(ctx, analytics)
 	if err != nil {
 		s.Logger.Warnw("failed to fully enrich analytics with feature and meter data",
 			"error", err,
@@ -1063,11 +1064,13 @@ func (s *eventPostProcessingService) GetDetailedUsageAnalytics(ctx context.Conte
 		}
 	}
 
-	return s.ToGetUsageAnalyticsResponseDTO(ctx, analytics)
+	return s.ToGetUsageAnalyticsResponseDTO(ctx, analytics, featureMap)
 }
 
-// enrichAnalyticsWithFeatureAndMeterData fetches and adds feature and meter data to analytics results
-func (s *eventPostProcessingService) enrichAnalyticsWithFeatureAndMeterData(ctx context.Context, analytics []*events.DetailedUsageAnalytic) error {
+// enrichAnalyticsWithFeatureAndMeterData fetches and adds feature and meter data to analytics results.
+// Returns a map of feature ID to feature for use when building the response (e.g. reporting usage).
+func (s *eventPostProcessingService) enrichAnalyticsWithFeatureAndMeterData(ctx context.Context, analytics []*events.DetailedUsageAnalytic) (map[string]*feature.Feature, error) {
+	featureMap := make(map[string]*feature.Feature)
 	// Extract all unique feature IDs
 	featureIDs := make([]string, 0)
 	featureIDSet := make(map[string]bool)
@@ -1081,7 +1084,7 @@ func (s *eventPostProcessingService) enrichAnalyticsWithFeatureAndMeterData(ctx 
 
 	// If no feature IDs, nothing to enrich
 	if len(featureIDs) == 0 {
-		return nil
+		return featureMap, nil
 	}
 
 	// Fetch all features in one call
@@ -1089,7 +1092,7 @@ func (s *eventPostProcessingService) enrichAnalyticsWithFeatureAndMeterData(ctx 
 	featureFilter.FeatureIDs = featureIDs
 	features, err := s.FeatureRepo.List(ctx, featureFilter)
 	if err != nil {
-		return ierr.WithError(err).
+		return nil, ierr.WithError(err).
 			WithHint("Failed to fetch features for enrichment").
 			Mark(ierr.ErrDatabase)
 	}
@@ -1097,7 +1100,6 @@ func (s *eventPostProcessingService) enrichAnalyticsWithFeatureAndMeterData(ctx 
 	// Extract all meter IDs from features
 	meterIDs := make([]string, 0)
 	meterIDSet := make(map[string]bool)
-	featureMap := make(map[string]*feature.Feature)
 
 	for _, f := range features {
 		featureMap[f.ID] = f
@@ -1107,12 +1109,31 @@ func (s *eventPostProcessingService) enrichAnalyticsWithFeatureAndMeterData(ctx 
 		}
 	}
 
+	// Attach group to features that belong to one (lazy-fetch per group id)
+	groupMap := make(map[string]*group.Group)
+	for _, f := range features {
+		if f.GroupID == "" {
+			continue
+		}
+		if grp, ok := groupMap[f.GroupID]; ok {
+			f.Group = grp
+			continue
+		}
+		grp, err := s.GroupRepo.Get(ctx, f.GroupID)
+		if err != nil {
+			s.Logger.Warnw("failed to fetch group for analytics", "group_id", f.GroupID, "error", err)
+			continue
+		}
+		groupMap[f.GroupID] = grp
+		f.Group = grp
+	}
+
 	// Fetch all meters in one call
 	meterFilter := types.NewNoLimitMeterFilter()
 	meterFilter.MeterIDs = meterIDs
 	meters, err := s.MeterRepo.List(ctx, meterFilter)
 	if err != nil {
-		return ierr.WithError(err).
+		return nil, ierr.WithError(err).
 			WithHint("Failed to fetch meters for enrichment").
 			Mark(ierr.ErrDatabase)
 	}
@@ -1138,7 +1159,7 @@ func (s *eventPostProcessingService) enrichAnalyticsWithFeatureAndMeterData(ctx 
 		}
 	}
 
-	return nil
+	return featureMap, nil
 }
 
 // ReprocessEvents triggers reprocessing of events for a customer or with other filters
@@ -1295,11 +1316,15 @@ func (s *eventPostProcessingService) isSubscriptionValidForEvent(
 	return true
 }
 
-func (s *eventPostProcessingService) ToGetUsageAnalyticsResponseDTO(ctx context.Context, analytics []*events.DetailedUsageAnalytic) (*dto.GetUsageAnalyticsResponse, error) {
+func (s *eventPostProcessingService) ToGetUsageAnalyticsResponseDTO(ctx context.Context, analytics []*events.DetailedUsageAnalytic, featureMap map[string]*feature.Feature) (*dto.GetUsageAnalyticsResponse, error) {
 	response := &dto.GetUsageAnalyticsResponse{
 		TotalCost: decimal.Zero,
 		Currency:  "",
 		Items:     make([]dto.UsageAnalyticItem, 0, len(analytics)),
+	}
+
+	if featureMap == nil {
+		featureMap = make(map[string]*feature.Feature)
 	}
 
 	// Convert analytics to response items
@@ -1318,6 +1343,19 @@ func (s *eventPostProcessingService) ToGetUsageAnalyticsResponseDTO(ctx context.
 			EventCount:      analytic.EventCount,
 			Properties:      analytic.Properties,
 			Points:          make([]dto.UsageAnalyticPoint, 0, len(analytic.Points)),
+		}
+
+		// If feature has reporting unit, convert total usage and include reporting unit fields; otherwise total_usage_display stays ""
+		if f, ok := featureMap[analytic.FeatureID]; ok && f.ReportingUnit != nil {
+			if reportingUsage, err := f.ToReportingValue(analytic.TotalUsage); err == nil {
+				item.TotalUsageDisplay = reportingUsage.String()
+				item.ReportingUnit = f.ReportingUnit
+			}
+		}
+
+		// Populate group when the feature belongs to a group
+		if f, ok := featureMap[analytic.FeatureID]; ok && f.Group != nil {
+			item.Group = f.Group
 		}
 
 		// Map time-series points if available

@@ -46,6 +46,7 @@ import (
 	"github.com/flexprice/flexprice/internal/security"
 	syncExport "github.com/flexprice/flexprice/internal/service/sync/export"
 	"github.com/gin-gonic/gin"
+	"github.com/nedpals/supabase-go"
 )
 
 // @title Flexprice API
@@ -205,6 +206,7 @@ func main() {
 			service.NewOAuthService,
 			service.NewTenantService,
 			service.NewAuthService,
+			provideSupabaseClient,
 			service.NewUserService,
 			service.NewEnvAccessService,
 			service.NewEnvironmentService,
@@ -398,6 +400,13 @@ func provideRouter(handlers api.Handlers, cfg *config.Configuration, logger *log
 	return api.NewRouter(handlers, cfg, logger, secretService, envAccessService, rbacService)
 }
 
+func provideSupabaseClient(cfg *config.Configuration) *supabase.Client {
+	if cfg == nil || cfg.Auth.Supabase.BaseURL == "" || cfg.Auth.Supabase.ServiceKey == "" {
+		return nil
+	}
+	return supabase.CreateClient(cfg.Auth.Supabase.BaseURL, cfg.Auth.Supabase.ServiceKey)
+}
+
 func provideTemporalConfig(cfg *config.Configuration) *config.TemporalConfig {
 	return &cfg.Temporal
 }
@@ -494,6 +503,11 @@ func startServer(
 		startRouter(lc, router, log)
 
 	case types.ModeTemporalWorker:
+		// Register webhook handler and start router so that webhook events
+		// published by temporal activities (e.g. invoice finalization) are
+		// consumed and delivered via Svix/native in the same process.
+		registerRouterHandlers(router, webhookService, onboardingService, eventPostProcessingSvc, eventConsumptionSvc, featureUsageSvc, costSheetUsageSvc, walletBalanceAlertSvc, rawEventConsumptionSvc, cfg, false)
+		startRouter(lc, router, log)
 		startTemporalWorker(lc, temporalService, params)
 	case types.ModeConsumer:
 		if consumer == nil {

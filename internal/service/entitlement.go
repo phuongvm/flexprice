@@ -407,11 +407,12 @@ func (s *entitlementService) GetEntitlement(ctx context.Context, id string) (*dt
 	response := &dto.EntitlementResponse{Entitlement: result}
 
 	// Add expanded fields
-	feature, err := s.FeatureRepo.Get(ctx, result.FeatureID)
+	fetaureService := NewFeatureService(s.ServiceParams)
+	feature, err := fetaureService.GetFeature(ctx, result.FeatureID)
 	if err != nil {
 		return nil, err
 	}
-	response.Feature = &dto.FeatureResponse{Feature: feature}
+	response.Feature = feature
 
 	if result.EntityType == types.ENTITLEMENT_ENTITY_TYPE_PLAN {
 		// TODO: !REMOVE after migration
@@ -715,7 +716,7 @@ func (s *entitlementService) GetAddonEntitlements(ctx context.Context, addonID s
 	return s.ListEntitlements(ctx, filter)
 }
 
-func (s *entitlementService) publishWebhookEvent(ctx context.Context, eventName string, entitlementID string) {
+func (s *entitlementService) publishWebhookEvent(ctx context.Context, eventName types.WebhookEventName, entitlementID string) {
 	webhookPayload, err := json.Marshal(webhookDto.InternalEntitlementEvent{
 		EntitlementID: entitlementID,
 		TenantID:      types.GetTenantID(ctx),

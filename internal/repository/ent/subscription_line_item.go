@@ -14,6 +14,11 @@ import (
 	"github.com/flexprice/flexprice/internal/types"
 )
 
+// subscriptionLineItemBatchSize is the maximum number of line items to insert in a single
+// bulk operation. PostgreSQL limits the total number of parameters to 65535; batching
+// prevents hitting that ceiling when a subscription has many line items.
+const subscriptionLineItemBatchSize = 1000
+
 type subscriptionLineItemRepository struct {
 	client    postgres.IClient
 	log       *logger.Logger
@@ -386,16 +391,24 @@ func (r *subscriptionLineItemRepository) CreateBulk(ctx context.Context, items [
 			SetUpdatedAt(item.UpdatedAt)
 	}
 
-	// Execute bulk create
-	_, err := client.SubscriptionLineItem.CreateBulk(bulk...).Save(ctx)
-	if err != nil {
-		SetSpanError(span, err)
-		return ierr.WithError(err).
-			WithHint("Failed to create subscription line items in bulk").
-			WithReportableDetails(map[string]interface{}{
-				"count": len(items),
-			}).
-			Mark(ierr.ErrDatabase)
+	// Execute bulk create in batches to avoid PostgreSQL's 65535 parameter limit.
+	for i := 0; i < len(bulk); i += subscriptionLineItemBatchSize {
+		end := i + subscriptionLineItemBatchSize
+		if end > len(bulk) {
+			end = len(bulk)
+		}
+		_, err := client.SubscriptionLineItem.CreateBulk(bulk[i:end]...).Save(ctx)
+		if err != nil {
+			SetSpanError(span, err)
+			return ierr.WithError(err).
+				WithHint("Failed to create subscription line items in bulk").
+				WithReportableDetails(map[string]interface{}{
+					"count":       len(items),
+					"batch_start": i,
+					"batch_end":   end,
+				}).
+				Mark(ierr.ErrDatabase)
+		}
 	}
 
 	SetSpanSuccess(span)
@@ -595,35 +608,12 @@ func (o SubscriptionLineItemQueryOptions) ApplyPaginationFilter(query Subscripti
 	return query.Limit(limit).Offset(offset)
 }
 
+// GetFieldName returns the ent field name for subscription_line_item; delegates to ent's ValidColumn so new schema fields are supported automatically.
 func (o SubscriptionLineItemQueryOptions) GetFieldName(field string) string {
-	switch field {
-	case "created_at":
-		return subscriptionlineitem.FieldCreatedAt
-	case "updated_at":
-		return subscriptionlineitem.FieldUpdatedAt
-	case "start_date":
-		return subscriptionlineitem.FieldStartDate
-	case "end_date":
-		return subscriptionlineitem.FieldEndDate
-	case "status":
-		return subscriptionlineitem.FieldStatus
-	case "subscription_id":
-		return subscriptionlineitem.FieldSubscriptionID
-	case "price_id":
-		return subscriptionlineitem.FieldPriceID
-	case "entity_id":
-		return subscriptionlineitem.FieldEntityID
-	case "entity_type":
-		return subscriptionlineitem.FieldEntityType
-	case "meter_id":
-		return subscriptionlineitem.FieldMeterID
-	case "currency":
-		return subscriptionlineitem.FieldCurrency
-	case "billing_period":
-		return subscriptionlineitem.FieldBillingPeriod
-	default:
+	if subscriptionlineitem.ValidColumn(field) {
 		return field
 	}
+	return ""
 }
 
 // applyEntityQueryOptions applies subscription line item-specific filters to the query
